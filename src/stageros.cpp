@@ -37,7 +37,6 @@
 // libstage
 #include <stage.hh>
 
-
 // roscpp
 #include <ros/ros.h>
 #include <boost/thread/mutex.hpp>
@@ -49,6 +48,7 @@
 #include <nav_msgs/Odometry.h>
 #include <geometry_msgs/Twist.h>
 #include <rosgraph_msgs/Clock.h>
+#include <sensor_msgs/Range.h>
 
 #include <std_srvs/Empty.h>
 
@@ -62,6 +62,7 @@
 #define BASE_SCAN "base_scan"
 #define BASE_POSE_GROUND_TRUTH "base_pose_ground_truth"
 #define CMD_VEL "cmd_vel"
+#define FIDUCIAL "fiducials"
 
 // Our node
 class StageNode
@@ -78,6 +79,7 @@ private:
     std::vector<Stg::ModelCamera *> cameramodels;
     std::vector<Stg::ModelRanger *> lasermodels;
     std::vector<Stg::ModelPosition *> positionmodels;
+    std::vector<Stg::ModelFiducial *> fiducialmodels;
 
     //a structure representing a robot inthe simulator
     struct StageRobot
@@ -86,6 +88,7 @@ private:
         Stg::ModelPosition* positionmodel; //one position
         std::vector<Stg::ModelCamera *> cameramodels; //multiple cameras per position
         std::vector<Stg::ModelRanger *> lasermodels; //multiple rangers per position
+        std::vector<Stg::ModelFiducial *> fiducialmodels;
 
         //ros publishers
         ros::Publisher odom_pub; //one odom
@@ -95,7 +98,8 @@ private:
         std::vector<ros::Publisher> depth_pubs; //multiple depths
         std::vector<ros::Publisher> camera_pubs; //multiple cameras
         std::vector<ros::Publisher> laser_pubs; //multiple lasers
-
+        std::vector<ros::Publisher> fiducial_pubs;
+        
         ros::Subscriber cmdvel_sub; //one cmd_vel subscriber
     };
 
@@ -229,20 +233,19 @@ StageNode::mapName(const char *name, size_t robotID, size_t deviceID, Stg::Model
 void
 StageNode::ghfunc(Stg::Model* mod, StageNode* node)
 {
-  //printf( "inspecting %s, parent\n", mod->Token() );
-
-  if (dynamic_cast<Stg::ModelRanger *>(mod)) {
-     node->lasermodels.push_back(dynamic_cast<Stg::ModelRanger *>(mod));
-  }
-  if (dynamic_cast<Stg::ModelPosition *>(mod)) {
-     Stg::ModelPosition * p = dynamic_cast<Stg::ModelPosition *>(mod);
+    if (dynamic_cast<Stg::ModelRanger *>(mod))
+        node->lasermodels.push_back(dynamic_cast<Stg::ModelRanger *>(mod));
+    if (dynamic_cast<Stg::ModelPosition *>(mod)) {
+      Stg::ModelPosition * p = dynamic_cast<Stg::ModelPosition *>(mod);
       // remember initial poses
       node->positionmodels.push_back(p);
       node->initial_poses.push_back(p->GetGlobalPose());
     }
-  if (dynamic_cast<Stg::ModelCamera *>(mod)) {
-     node->cameramodels.push_back(dynamic_cast<Stg::ModelCamera *>(mod));
-  }
+    if (dynamic_cast<Stg::ModelCamera *>(mod))
+        node->cameramodels.push_back(dynamic_cast<Stg::ModelCamera *>(mod));
+    if (dynamic_cast<Stg::ModelFiducial *> (mod)){
+        node->fiducialmodels.push_back(dynamic_cast<Stg::ModelFiducial *> (mod));
+    }
 }
 
 
@@ -285,6 +288,7 @@ StageNode::StageNode(int argc, char** argv, bool gui, const char* fname, bool us
     if(!localn.getParam("is_depth_canonical", isDepthCanonical))
         isDepthCanonical = true;
 
+
     // We'll check the existence of the world file, because libstage doesn't
     // expose its failure to open it.  Could go further with checks (e.g., is
     // it readable by this user).
@@ -303,13 +307,16 @@ StageNode::StageNode(int argc, char** argv, bool gui, const char* fname, bool us
     else
         this->world = new Stg::World();
 
+    // Apparently an Update is needed before the Load to avoid crashes on
+    // startup on some systems.
+    // As of Stage 4.1.1, this update call causes a hang on start.
+    //this->UpdateWorld();
     this->world->Load(fname);
 
-    // todo: reverse the order of these next lines? try it .
-
+    // We add our callback here, after the Update, so avoid our callback
+    // being invoked before we're ready.
     this->world->AddUpdateCallback((Stg::world_callback_t)s_update, this);
 
-    // inspect every model to locate the things we care about
     this->world->ForEachDescendant((Stg::model_callback_t)ghfunc, this);
 }
 
@@ -331,15 +338,22 @@ StageNode::SubscribeModels()
         new_robot->positionmodel = this->positionmodels[r];
         new_robot->positionmodel->Subscribe();
 
-	ROS_INFO( "Subscribed to Stage position model \"%s\"", this->positionmodels[r]->Token() ); 
-		      
+
         for (size_t s = 0; s < this->lasermodels.size(); s++)
         {
-	  if (this->lasermodels[s] and this->lasermodels[s]->Parent() == new_robot->positionmodel)
+            if (this->lasermodels[s] and this->lasermodels[s]->Parent() == new_robot->positionmodel)
             {
                 new_robot->lasermodels.push_back(this->lasermodels[s]);
                 this->lasermodels[s]->Subscribe();
-	      ROS_INFO( "subscribed to Stage ranger \"%s\"", this->lasermodels[s]->Token() ); 
+            }
+        }
+
+        for (size_t s = 0; s < this->fiducialmodels.size(); s++)
+        {
+            if (this->fiducialmodels[s] and this->fiducialmodels[s]->Parent() == new_robot->positionmodel)
+            {
+                new_robot->fiducialmodels.push_back(this->fiducialmodels[s]);
+                this->fiducialmodels[s]->Subscribe();
             }
         }
 
@@ -349,16 +363,10 @@ StageNode::SubscribeModels()
             {
                 new_robot->cameramodels.push_back(this->cameramodels[s]);
                 this->cameramodels[s]->Subscribe();
-
-		ROS_INFO( "subscribed to Stage camera model \"%s\"", this->cameramodels[s]->Token() ); 
             }
         }
 
-	// TODO - print the topic names nicely as well
-        ROS_INFO("Robot %s provided %lu rangers and %lu cameras",
-		 new_robot->positionmodel->Token(),
-		 new_robot->lasermodels.size(),
-		 new_robot->cameramodels.size() );
+        ROS_INFO("Found %lu laser devices and %lu cameras in robot %lu", new_robot->lasermodels.size(), new_robot->cameramodels.size(), r);
 
         new_robot->odom_pub = n_.advertise<nav_msgs::Odometry>(mapName(ODOM, r, static_cast<Stg::Model*>(new_robot->positionmodel)), 10);
         new_robot->ground_truth_pub = n_.advertise<nav_msgs::Odometry>(mapName(BASE_POSE_GROUND_TRUTH, r, static_cast<Stg::Model*>(new_robot->positionmodel)), 10);
@@ -370,6 +378,15 @@ StageNode::SubscribeModels()
                 new_robot->laser_pubs.push_back(n_.advertise<sensor_msgs::LaserScan>(mapName(BASE_SCAN, r, static_cast<Stg::Model*>(new_robot->positionmodel)), 10));
             else
                 new_robot->laser_pubs.push_back(n_.advertise<sensor_msgs::LaserScan>(mapName(BASE_SCAN, r, s, static_cast<Stg::Model*>(new_robot->positionmodel)), 10));
+
+        }
+
+        for (size_t s = 0;  s < new_robot->fiducialmodels.size(); ++s)
+        {
+            if (new_robot->fiducialmodels.size() == 1)
+                new_robot->fiducial_pubs.push_back(n_.advertise<sensor_msgs::Range>(mapName(FIDUCIAL, r, static_cast<Stg::Model*>(new_robot->positionmodel)), 10));
+            else
+             new_robot->fiducial_pubs.push_back(n_.advertise<sensor_msgs::Range>(mapName(FIDUCIAL, r, s, static_cast<Stg::Model*>(new_robot->positionmodel)), 10));
 
         }
 
@@ -414,12 +431,6 @@ StageNode::UpdateWorld()
 void
 StageNode::WorldCallback()
 {
-  if( ! ros::ok() ) {
-    ROS_INFO( "ros::ok() is false. Quitting." );
-    this->world->QuitAll();
-    return;
-  }
-  
     boost::mutex::scoped_lock lock(msg_lock);
 
     this->sim_time.fromSec(world->SimTimeNow() / 1e6);
@@ -572,6 +583,28 @@ StageNode::WorldCallback()
         ground_truth_msg.header.stamp = sim_time;
 
         robotmodel->ground_truth_pub.publish(ground_truth_msg);
+
+        for(size_t s = 0; s < robotmodel->fiducialmodels.size(); ++s)
+        {
+            Stg::ModelFiducial* fiducialmodel = robotmodel->fiducialmodels[s];
+            std::vector<Stg::ModelFiducial::Fiducial> fiducials = fiducialmodel->GetFiducials();
+            if(robotmodel->fiducial_pubs[s].getNumSubscribers() > 0 && fiducials.size() > 0){
+                ROS_INFO("Publishing fiducial...");
+                sensor_msgs::Range fiducial_msg;
+
+                fiducial_msg.radiation_type = 1;
+                fiducial_msg.field_of_view = fiducialmodel->fov;
+                fiducial_msg.max_range = fiducials[0].range;
+                fiducial_msg.min_range = fiducials[0].range;
+                fiducial_msg.range = INFINITY;
+                if (robotmodel->fiducialmodels.size() > 1)
+                    fiducial_msg.header.frame_id = mapName("fiducial", r, s, static_cast<Stg::Model*>(robotmodel->positionmodel));
+                else
+                    fiducial_msg.header.frame_id = mapName("fiducial", r,static_cast<Stg::Model*>(robotmodel->positionmodel));
+                fiducial_msg.header.stamp = sim_time;
+                robotmodel->fiducial_pubs[s].publish(fiducial_msg);
+            }
+        }
 
         //cameras
         for (size_t s = 0; s < robotmodel->cameramodels.size(); ++s)
@@ -748,7 +781,7 @@ StageNode::WorldCallback()
 
 int 
 main(int argc, char** argv)
-{
+{ 
     if( argc < 2 )
     {
         puts(USAGE);
@@ -774,12 +807,25 @@ main(int argc, char** argv)
 
     boost::thread t = boost::thread(boost::bind(&ros::spin));
 
+    // New in Stage 4.1.1: must Start() the world.
     sn.world->Start();
 
-    Stg::World::Run();
-    
+    // TODO: get rid of this fixed-duration sleep, using some Stage builtin
+    // PauseUntilNextUpdate() functionality.
+    ros::WallRate r(10.0);
+    while(ros::ok() && !sn.world->TestQuit())
+    {
+        if(gui)
+            Fl::wait(r.expectedCycleTime().toSec());
+        else
+        {
+            sn.UpdateWorld();
+            r.sleep();
+        }
+    }
     t.join();
 
     exit(0);
 }
+
 
