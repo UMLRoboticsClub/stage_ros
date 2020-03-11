@@ -35,7 +35,7 @@
 
 
 // libstage
-#include <stage.hh>
+#include "/home/lili/stg/include/Stage-4.3/stage.hh"
 
 // roscpp
 #include <ros/ros.h>
@@ -49,6 +49,7 @@
 #include <geometry_msgs/Twist.h>
 #include <rosgraph_msgs/Clock.h>
 #include <sensor_msgs/Range.h>
+#include <std_msgs/Empty.h>
 
 #include <std_srvs/Empty.h>
 
@@ -63,6 +64,7 @@
 #define BASE_POSE_GROUND_TRUTH "base_pose_ground_truth"
 #define CMD_VEL "cmd_vel"
 #define FIDUCIAL "fiducials"
+#define BLOB "see_blob"
 
 // Our node
 class StageNode
@@ -80,6 +82,7 @@ private:
     std::vector<Stg::ModelRanger *> lasermodels;
     std::vector<Stg::ModelPosition *> positionmodels;
     std::vector<Stg::ModelFiducial *> fiducialmodels;
+    std::vector<Stg::ModelBlobfinder *> blobmodels;
 
     //a structure representing a robot inthe simulator
     struct StageRobot
@@ -89,10 +92,12 @@ private:
         std::vector<Stg::ModelCamera *> cameramodels; //multiple cameras per position
         std::vector<Stg::ModelRanger *> lasermodels; //multiple rangers per position
         std::vector<Stg::ModelFiducial *> fiducialmodels;
+        std::vector<Stg::ModelBlobfinder *> blobmodels;
 
         //ros publishers
         ros::Publisher odom_pub; //one odom
         ros::Publisher ground_truth_pub; //one ground truth
+        ros::Publisher blob_pub;
 
         std::vector<ros::Publisher> image_pubs; //multiple images
         std::vector<ros::Publisher> depth_pubs; //multiple depths
@@ -246,6 +251,10 @@ StageNode::ghfunc(Stg::Model* mod, StageNode* node)
     if (dynamic_cast<Stg::ModelFiducial *> (mod)){
         node->fiducialmodels.push_back(dynamic_cast<Stg::ModelFiducial *> (mod));
     }
+    if (dynamic_cast<Stg::ModelBlobfinder *> (mod)){
+        ROS_INFO("Found a blobfinder");
+        node->blobmodels.push_back(dynamic_cast<Stg::ModelBlobfinder *> (mod));
+    }
 }
 
 
@@ -366,12 +375,21 @@ StageNode::SubscribeModels()
             }
         }
 
+        for (size_t s = 0; s < this->blobmodels.size(); s++)
+        {
+            if (this->blobmodels[s] and this->blobmodels[s]->Parent() == new_robot->positionmodel)
+            {
+                new_robot->blobmodels.push_back(this->blobmodels[s]);
+                this->blobmodels[s]->Subscribe();
+            }
+        }
+
         ROS_INFO("Found %lu laser devices and %lu cameras in robot %lu", new_robot->lasermodels.size(), new_robot->cameramodels.size(), r);
 
         new_robot->odom_pub = n_.advertise<nav_msgs::Odometry>(mapName(ODOM, r, static_cast<Stg::Model*>(new_robot->positionmodel)), 10);
         new_robot->ground_truth_pub = n_.advertise<nav_msgs::Odometry>(mapName(BASE_POSE_GROUND_TRUTH, r, static_cast<Stg::Model*>(new_robot->positionmodel)), 10);
         new_robot->cmdvel_sub = n_.subscribe<geometry_msgs::Twist>(mapName(CMD_VEL, r, static_cast<Stg::Model*>(new_robot->positionmodel)), 10, boost::bind(&StageNode::cmdvelReceived, this, r, _1));
-
+        new_robot->blob_pub = n_.advertise<std_msgs::Empty>(mapName(BLOB, r, static_cast<Stg::Model*>(new_robot->positionmodel)), 10);
         for (size_t s = 0;  s < new_robot->lasermodels.size(); ++s)
         {
             if (new_robot->lasermodels.size() == 1)
@@ -603,6 +621,17 @@ StageNode::WorldCallback()
                     fiducial_msg.header.frame_id = mapName("fiducial", r,static_cast<Stg::Model*>(robotmodel->positionmodel));
                 fiducial_msg.header.stamp = sim_time;
                 robotmodel->fiducial_pubs[s].publish(fiducial_msg);
+            }
+        }
+
+        for(size_t s = 0; s < robotmodel->blobmodels.size(); ++s){
+            Stg::ModelBlobfinder* blobmodel = robotmodel->blobmodels[s];  
+            std::vector<Stg::ModelBlobfinder::Blob> blobs = blobmodel->GetBlobs(); 
+
+            //ROS_INFO_COND(blobs.size() > 0, "Found %d blobs", blobs.size());
+            if(blobs.size() > 0) { 
+                //ROS_INFO("Publishing blob message");
+                robotmodel->blob_pub.publish(std_msgs::Empty()); 
             }
         }
 
